@@ -1,0 +1,222 @@
+import asyncio
+import requests
+import time
+from telegram import Bot
+
+# ===== 配置区（已经帮你填好，不要改） =====
+BOT_TOKEN = "8806286461:AAGy6bExBRjjwWBhcpHcFUDtIHWlvcnuOXo"
+CHAT_ID = "-1003917009914"
+API_URL = "https://super.pc28998.com/history/JND28?page=1"
+INTERVAL = 300
+
+# ===== 核心算法（和你原来的逻辑一致） =====
+SUM_MAP = {
+    '大单': [15,17,19,21,23,25,27],
+    '大双': [14,16,18,20,22,24,26],
+    '小单': [1,3,5,7,9,11,13],
+    '小双': [0,2,4,6,8,10,12]
+}
+ALL_TYPES = ['大单','大双','小单','小双']
+
+def get_type(s):
+    return ('大' if s >= 14 else '小') + ('双' if s % 2 == 0 else '单')
+
+def fetch_rows():
+    rows = []
+    seen = set()
+    try:
+        r = requests.get(API_URL, timeout=10)
+        data = r.json().get('data', [])
+        for item in data:
+            code = item.get('opencode', '').strip()
+            expect = item.get('expect', '')
+            if not code or expect in seen:
+                continue
+            seen.add(expect)
+            nums = [int(x) for x in code.split(',')]
+            s = sum(nums)
+            rows.append({
+                'period': expect,
+                'nums': code,
+                'sum': s,
+                'type': get_type(s),
+                'time': item.get('opentime_text', '')
+            })
+        rows.sort(key=lambda x: int(x['period']))
+        return rows
+    except Exception:
+        return None
+
+def get_type_omission(rows):
+    last = {}
+    for i, r in enumerate(rows):
+        last[r['type']] = i
+    total = len(rows)
+    return {t: (total - 1 - last[t]) if last[t] >= 0 else total for t in ALL_TYPES}
+
+def get_sum_omission(rows):
+    last = {}
+    for i, r in enumerate(rows):
+        last[r['sum']] = i
+    total = len(rows)
+    return {s: (total - 1 - last[s]) if last[s] >= 0 else total for s in range(28)}
+
+def best_sums_by_omission(type_name, sum_omission, top_n=3):
+    candidates = SUM_MAP.get(type_name, [])
+    return sorted(candidates, key=lambda s: sum_omission.get(s, 0), reverse=True)[:top_n]
+
+def calc_score(rows, params):
+    scores = {t: 0.0 for t in ALL_TYPES}
+    if len(rows) < 5:
+        return scores
+
+    window = params.get('kill_window', 5)
+    last_w = rows[-window:]
+    n = len(last_w)
+    heat = {t: 0.0 for t in ALL_TYPES}
+    for i, r in enumerate(last_w):
+        heat[r['type']] += (i + 1) / n
+    kill = max(heat, key=lambda t: heat[t])
+    kb = params.get('kill_bonus', 28)
+    kp = params.get('kill_penalty', 22)
+    for t in ALL_TYPES:
+        scores[t] += kb if t != kill else -kp
+
+    type_o = get_type_omission(rows)
+    max_o = max(type_o.values()) or 1
+    for t in ALL_TYPES:
+        scores[t] += (type_o[t] / max_o) * params.get('omission_w', 38)
+
+    last20 = rows[-20:] if len(rows) >= 20 else rows
+    n20 = len(last20)
+    big_cnt = sum(1 for r in last20 if r['type'].startswith('大'))
+    odd_cnt = sum(1 for r in last20 if r['type'].endswith('单'))
+    big_r = big_cnt / n20
+    odd_r = odd_cnt / n20
+    th = params.get('balance_th', 0.60)
+    bw = params.get('balance_w', 22)
+    for t in ALL_TYPES:
+        if big_r > th and t.startswith('小'):
+            scores[t] += bw
+        elif big_r < (1 - th) and t.startswith('大'):
+            scores[t] += bw
+        if odd_r > th and t.endswith('双'):
+            scores[t] += bw
+        elif odd_r < (1 - th) and t.endswith('单'):
+            scores[t] += bw
+
+    streak_type = rows[-1]['type']
+    streak_len = 0
+    for r in reversed(rows):
+        if r['type'] == streak_type:
+            streak_len += 1
+        else:
+            break
+    if streak_len >= 2:
+        scores[streak_type] -= streak_len * params.get('streak_mult', 14)
+
+    if len(rows) >= 3:
+        last_type = rows[-1]['type']
+        count = {t: 0 for t in ALL_TYPES}
+        for i in range(1, len(rows)):
+            if rows[i-1]['type'] == last_type:
+                count[rows[i]['type']] += 1
+        total = sum(count.values()) or 1
+        for t in ALL_TYPES:
+            scores[t] += (count[t] / total) * params.get('trans1_w', 18)
+
+    last10 = rows[-10:] if len(rows) >= 10 else rows
+    freq10 = {t: 0 for t in ALL_TYPES}
+    for r in last10:
+        freq10[r['type']] += 1
+    th2 = params.get('overfreq_th', 4)
+    pen = params.get('overfreq_penalty', 9)
+    for t in ALL_TYPES:
+        if freq10[t] >= th2:
+            scores[t] -= (freq10[t] - 2.5) * pen
+
+    recent30 = rows[-30:] if len(rows) >= 30 else rows
+    decay = 0.88
+    decay_freq = {t: 0.0 for t in ALL_TYPES}
+    n30 = len(recent30)
+    for i, r in enumerate(recent30):
+        decay_freq[r['type']] += decay ** (n30 - 1 - i)
+    max_df = max(decay_freq.values()) or 1
+    for t in ALL_TYPES:
+        scores[t] += (1 - decay_freq[t] / max_df) * params.get('decay_w', 18)
+
+    return scores
+
+def predict(rows):
+    params = {
+        'omission_w': 38,
+        'balance_th': 0.60,
+        'balance_w': 22,
+        'streak_mult': 14,
+        'trans1_w': 18,
+        'kill_window': 5,
+        'decay_w': 18,
+        'overfreq_th': 4,
+        'overfreq_penalty': 9,
+        'kill_bonus': 28,
+        'kill_penalty': 22
+    }
+    scores = calc_score(rows, params)
+    ranked = sorted(ALL_TYPES, key=lambda t: scores[t], reverse=True)
+    sum_o = get_sum_omission(rows)
+    return {
+        'ranked': ranked,
+        'scores': scores,
+        'kill': ranked[-1],
+        'top2': ranked[:2],
+        'defense': ranked[2] if len(ranked) > 2 else ranked[-1],
+        'sums': {
+            '推荐1': best_sums_by_omission(ranked[0], sum_o, 3),
+            '推荐2': best_sums_by_omission(ranked[1], sum_o, 3)
+        }
+    }
+
+def format_message(rows, result):
+    lines = []
+    lines.append('=' * 40)
+    lines.append('  降温预测系统')
+    lines.append(f'  更新: {time.strftime("%Y-%m-%d %H:%M:%S")}')
+    lines.append('=' * 40)
+    lines.append('')
+    latest = rows[-1]
+    lines.append(f'【最新开奖】第 {latest["period"]} 期')
+    lines.append(f'  号码: {latest["nums"]}  和值: {latest["sum"]}  形态: {latest["type"]}')
+    lines.append('')
+    lines.append('【下期预测】')
+    lines.append(f'  杀号: {result["kill"]}')
+    for i, t in enumerate(result["top2"]):
+        sums = ', '.join(str(s) for s in result["sums"][f"推荐{i+1}"])
+        sc = int(result["scores"][t])
+        stars = '★' * min(3, max(1, sc // 20))
+        lines.append(f'  推荐{i+1} {stars} {t}  和值: {sums}')
+    lines.append(f'  防守: {result["defense"]}')
+    lines.append('')
+    lines.append('=' * 40)
+    lines.append('  ⚠️ 数据仅供参考，请理性对待')
+    lines.append('=' * 40)
+    return '\n'.join(lines)
+
+# ===== 主循环 =====
+async def main():
+    bot = Bot(token=BOT_TOKEN)
+    while True:
+        try:
+            rows = fetch_rows()
+            if rows and len(rows) >= 10:
+                result = predict(rows)
+                msg = format_message(rows, result)
+                await bot.send_message(chat_id=CHAT_ID, text=msg)
+                print(f"✅ 已发送预测 {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                print("❌ 数据获取失败，等待重试...")
+        except Exception as e:
+            print(f"⚠️ 错误: {e}")
+        await asyncio.sleep(INTERVAL)
+
+if __name__ == '__main__':
+    asyncio.run(main())
